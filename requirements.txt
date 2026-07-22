@@ -7,3 +7,8 @@ httpx
 paho-mqtt>=2.0
 numpy
 python-dotenv
+edge-tts
+pynput
+
+# torch + torchaudio are NOT installed from this file — the PyPI build pulls
+# in CUDA. Install the CPU build separately, see README.md step 4.
