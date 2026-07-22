@@ -1,0 +1,9 @@
+silero-vad
+vosk
+piper-tts
+sounddevice
+groq
+httpx
+paho-mqtt>=2.0
+numpy
+python-dotenv
