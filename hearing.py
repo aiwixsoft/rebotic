@@ -45,12 +45,14 @@ class Hearing:
 
         # Online STT tier: Vosk's final transcript is the instant, always-available
         # answer; Groq Whisper — sent in parallel with the raw turn audio — replaces
-        # it when it lands in time. Empty model or no key = tier stays off, Vosk-only.
-        self._stt_online = bool(getattr(config, "STT_ONLINE_MODEL", "")) and bool(config.GROQ_API_KEY)
-        self._stt_client = (
-            AsyncGroq(api_key=config.GROQ_API_KEY, timeout=config.STT_ONLINE_TIMEOUT_S, max_retries=0)
-            if self._stt_online else None
-        )
+        # it when it lands in time. Empty model or no keys = tier stays off, Vosk-only.
+        # One client per key (GROQ_API_KEY/_2/_3/...) — separate quota buckets,
+        # rotated in _transcribe_online on failure, same idea as brain.py's LLM cascade.
+        self._stt_online = bool(getattr(config, "STT_ONLINE_MODEL", "")) and bool(config.GROQ_API_KEYS)
+        self._stt_clients = [
+            AsyncGroq(api_key=key, timeout=config.STT_ONLINE_TIMEOUT_S, max_retries=0)
+            for key in config.GROQ_API_KEYS
+        ] if self._stt_online else []
         max_audio_frames = int(config.STT_ONLINE_MAX_S * config.SAMPLE_RATE / config.FRAME_SIZE)
         self._audio_frames: deque = deque(maxlen=max_audio_frames)
 
@@ -64,6 +66,11 @@ class Hearing:
         # VAD state machine
         self._speaking = False
         self._ptt_down = False
+        # Visitor sessions: a quick PTT tap (not a held word) signals "new
+        # visitor". Only meaningful when THIS press is what started speaking —
+        # a PTT release during an already-VAD-active utterance is never a tap.
+        self._ptt_press_t = 0.0
+        self._ptt_initiated_speaking = False
         self._on_count = 0
         self._silence_ms = 0.0
         self._speech_ms = 0.0
@@ -159,9 +166,16 @@ class Hearing:
             return  # key auto-repeat
         self._ptt_down = down
         if down and not self._speaking:
+            self._ptt_press_t = time.monotonic()
+            self._ptt_initiated_speaking = True
             self._enter_speaking()      # button down → force speech_start, bypass VAD
         elif not down and self._speaking:
-            self._finalize()            # button up → end-of-turn immediately
+            held_ms = (time.monotonic() - self._ptt_press_t) * 1000
+            if self._ptt_initiated_speaking and held_ms < self.cfg.PTT_TAP_MAX_MS:
+                self._cancel_as_tap()   # quick tap, not a spoken turn — new-session signal
+            else:
+                self._finalize()        # button up → end-of-turn immediately
+            self._ptt_initiated_speaking = False
 
     # ── VAD state machine ────────────────────────────────────────────────────
 
@@ -341,6 +355,21 @@ class Hearing:
         else:
             self.bus.publish(events.final(text, gender))
 
+    def _cancel_as_tap(self) -> None:
+        """A quick PTT tap (<PTT_TAP_MAX_MS, see _set_ptt) signals 'new
+        visitor session' rather than a spoken turn — same recognizer/VAD/
+        buffer reset as _finalize, but skips the transcript entirely and
+        publishes new_session instead of final."""
+        self._speaking = False
+        self._rec.Reset()
+        self._vad.reset_states()
+        self._pitch_frames.clear()
+        self._audio_frames.clear()
+        self._finalized.clear()
+        self._last_partial = ""
+        self._silence_ms = 0.0
+        self.bus.publish(events.new_session())
+
     async def _publish_online(self, fallback_text: str, gender: str, pcm: bytes) -> None:
         """Vosk's transcript already shipped as `fallback_text` — try to beat it
         with Groq Whisper before the event goes out. A miss costs nothing but
@@ -365,12 +394,20 @@ class Hearing:
             w.setsampwidth(2)  # int16
             w.setframerate(self.cfg.SAMPLE_RATE)
             w.writeframes(pcm)
-        resp = await self._stt_client.audio.transcriptions.create(
-            file=("turn.wav", buf.getvalue()),
-            model=self.cfg.STT_ONLINE_MODEL,
-            language=getattr(self.cfg, "STT_ONLINE_LANGUAGE", "en"),
-        )
-        return resp.text
+        wav_bytes = buf.getvalue()
+        last_err: Exception = RuntimeError("no Groq keys configured for online STT")
+        for client in self._stt_clients:
+            try:
+                resp = await client.audio.transcriptions.create(
+                    file=("turn.wav", wav_bytes),
+                    model=self.cfg.STT_ONLINE_MODEL,
+                    language=getattr(self.cfg, "STT_ONLINE_LANGUAGE", "en"),
+                )
+                return resp.text
+            except Exception as e:
+                last_err = e
+                log.warning("groq whisper key failed: %r — trying next key", e)
+        raise last_err
 
 
 # ── standalone test ───────────────────────────────────────────────────────────

@@ -13,7 +13,8 @@ import time
 from typing import AsyncIterator
 
 import config
-from brain import Brain
+import guests
+from brain import Brain, _extract_name
 from bus import Bus
 from hearing import Hearing
 from robot import Robot
@@ -30,9 +31,13 @@ class Rebotic:
         self.hearing = Hearing(self.bus, config)
         self.brain = Brain(self.bus, config)
         self.voice = Voice(self.bus, self.robot, config)
+        self.guests = guests.load(config.SPECIAL_GUEST_FILE)
 
         self._speak_task: asyncio.Task | None = None
         self._interrupted = False
+        # Visitor sessions (PTT tap, see hearing.py's _cancel_as_tap)
+        self._awaiting_name = False
+        self._name_attempts = 0
         # per-turn latency marks
         self._t_final = 0.0
         self._t_first_token: float | None = None
@@ -92,6 +97,8 @@ class Rebotic:
                 log.debug("partial: %s", ev.data["text"])
             elif ev.type == "barge_in":
                 self._interrupt()
+            elif ev.type == "new_session":
+                self._start_new_session()
             elif ev.type == "final":
                 text = ev.data["text"]
                 gender = ev.data.get("gender", "unknown")
@@ -99,7 +106,10 @@ class Rebotic:
                 print(f"you said: {text}  (voice: {gender})")
                 if self._speak_task and not self._speak_task.done():
                     self._interrupt()  # safety — shouldn't happen without barge_in
-                self._speak_task = asyncio.create_task(self._turn(text))
+                if self._awaiting_name:
+                    self._speak_task = asyncio.create_task(self._handle_name_reply(text))
+                else:
+                    self._speak_task = asyncio.create_task(self._turn(text))
 
     @staticmethod
     async def _say(text: str) -> AsyncIterator[str]:
@@ -112,24 +122,75 @@ class Rebotic:
         self.brain.abort()
         self.voice.kill()  # cuts mid-word, amp:0, state:attend
 
+    # ── visitor sessions ─────────────────────────────────────────────────────
+
+    def _start_new_session(self) -> None:
+        """PTT tap (hearing.py's _cancel_as_tap) — new visitor. Ends whatever
+        was happening, resets brain history + voice gender lock, then asks
+        for a name before resuming normal conversation."""
+        log.info("new session — PTT tap")
+        if self._speak_task and not self._speak_task.done():
+            self._interrupt()
+        self.brain.reset()
+        self.voice.reset_gender()
+        self._awaiting_name = True
+        self._name_attempts = 0
+        self._speak_task = asyncio.create_task(self._say_line(config.SESSION_NAME_PROMPT))
+
+    async def _handle_name_reply(self, text: str) -> None:
+        # Check the full raw transcript against the roster BEFORE the generic
+        # <=2-word name extractor runs — VIPs are often introduced with a
+        # title attached ("I'm the Chief Minister, Sohail Afridi"), which
+        # _extract_name would otherwise mangle into just "Chief Minister".
+        guest = self.guests.match_in_text(text)
+        if guest:
+            self._awaiting_name = False
+            # VIP match — personalized LLM welcome instead of the generic ack
+            await self._speak(self.brain.welcome_special_guest(guest))
+            return
+
+        name = _extract_name(text)
+        if name:
+            self._awaiting_name = False
+            self.brain.set_visitor_name(name)
+            await self._say_line(config.SESSION_NAME_ACK.format(name=name))
+        elif self._name_attempts == 0:
+            self._name_attempts += 1
+            await self._say_line(config.SESSION_NAME_RETRY_PROMPT)
+        else:
+            # two unclear tries — stop asking and answer what they actually
+            # said instead, rather than leaving them met with silence
+            self._awaiting_name = False
+            await self._turn(text)
+
+    async def _speak(self, tokens: AsyncIterator[str]) -> None:
+        """THINK → SPEAK → RESET, shared by _turn/_say_line/guest welcome —
+        same state/interrupt handling regardless of where the token stream
+        (LLM-generated or a fixed line) comes from."""
+        self._interrupted = False
+        self.robot.state("thinking")
+        try:
+            self.hearing.robot_speaking = True  # duck VAD, arm barge-in
+            await self.voice.speak_stream(tokens)
+        finally:
+            self.hearing.robot_speaking = False
+        if not self._interrupted:
+            self.robot.state("idle")  # RESET — barge-in already set attend instead
+
+    async def _say_line(self, text: str) -> None:
+        """A fixed, non-LLM-generated line (session prompts)."""
+        await self._speak(self._say(text))
+
     # ── one conversation turn ────────────────────────────────────────────────
 
     async def _turn(self, text: str) -> None:
-        self._interrupted = False
         self._t_final = time.perf_counter()
         self._t_first_token = None
         self._t_first_audio = None
 
         # THINK — filler is brain's first yield, so it plays NOW
-        self.robot.state("thinking")
-        try:
-            self.hearing.robot_speaking = True  # duck VAD, arm barge-in
-            await self.voice.speak_stream(self._tap(self.brain.respond(text)))
-        finally:
-            self.hearing.robot_speaking = False
+        await self._speak(self._tap(self.brain.respond(text)))
 
-        if not self._interrupted:
-            self.robot.state("idle")  # RESET — barge-in already set attend instead
         if self.latency:
             self._report_latency(time.perf_counter())
 

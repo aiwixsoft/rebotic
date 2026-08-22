@@ -201,6 +201,14 @@ class Voice:
         self._gender = gender
         self._gender_locked = True
 
+    def reset_gender(self) -> None:
+        """Explicit session boundary (PTT tap, see hearing.py) — drop back to
+        the default voice and unlock, same fields the timeout-based unlock in
+        set_gender above already uses."""
+        self._gender = getattr(self.cfg, "TTS_DEFAULT_GENDER", "female")
+        self._gender_locked = False
+        self._last_gender_set = 0.0
+
     async def speak_stream(self, tokens: AsyncIterator[str]) -> None:
         """Flush to Piper on clause boundaries; first clause plays while the
         LLM is still generating the rest."""

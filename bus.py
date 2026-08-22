@@ -37,6 +37,12 @@ def barge_in() -> Event:
     return Event("barge_in")
 
 
+def new_session() -> Event:
+    """PTT tap (short press) — visitor signals a fresh conversation.
+    Ends whatever session was active and starts a new one."""
+    return Event("new_session")
+
+
 # ─── Bus ─────────────────────────────────────────────────────────────────────
 
 class Bus:

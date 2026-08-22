@@ -163,7 +163,7 @@ cd ..
 Either way you should end up with `models/en_US-amy-medium.onnx(.json)`,
 `models/en_US-ryan-medium.onnx(.json)`, and `models/vosk-model-small-en-us-0.15/`.
 
-## 6. Groq API key (cloud LLM + cloud speech recognition)
+## 6. API keys (Groq required, Tavily optional)
 
 ```bash
 cp .env.example .env          # Windows PowerShell/cmd: copy .env.example .env
@@ -175,11 +175,17 @@ edit `.env`:
 ```
 GROQ_API_KEY=gsk_...
 GROQ_API_KEY_2=          # optional — a second key doubles your quota, rotated on 429s
+TAVILY_API_KEY=          # optional — powers live web search, see below
 ```
 
 **No Groq key?** The app still runs — `LLM_BACKEND` falls back through Ollama (step 7)
 down to scripted canned answers, and speech recognition falls back to the offline Vosk
 model automatically. You just lose the cloud tiers' accuracy/quality.
+
+**Tavily key (optional)** — without it, time-sensitive questions ("who is the current
+PM of X") get an honest "I don't have that info" instead of a live answer. With it, the
+robot does a real web search and answers from actual current results. Free, no card
+required: sign up at [tavily.com](https://tavily.com) → API Keys.
 
 ## 7. Ollama (offline LLM fallback — recommended)
 

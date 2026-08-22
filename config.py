@@ -11,8 +11,19 @@ load_dotenv()
 
 # ─── Secrets (.env) ──────────────────────────────────────────────────────────
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2", "")  # second quota bucket, rotate on 429
+def _collect_keys(prefix: str, max_keys: int = 12) -> list[str]:
+    """Reads PREFIX, PREFIX_2, PREFIX_3, ... PREFIX_{max_keys} from .env —
+    each one a separate account, so a separate quota bucket. Every provider's
+    client rotates through whatever's configured on a 429/quota error before
+    falling further down the cascade. Unset slots are just skipped, so gaps
+    are fine (e.g. only _2 and _4 set). Bump max_keys if you ever need more
+    than a dozen accounts for one provider."""
+    keys = [v for v in (os.getenv(prefix, ""),) if v]
+    keys += [v for i in range(2, max_keys + 1) if (v := os.getenv(f"{prefix}_{i}", ""))]
+    return keys
+
+GROQ_API_KEYS = _collect_keys("GROQ_API_KEY")     # LLM cascade + Groq Whisper STT
+TAVILY_API_KEYS = _collect_keys("TAVILY_API_KEY")  # live web search
 
 # ─── MQTT / robot body ───────────────────────────────────────────────────────
 
@@ -76,6 +87,15 @@ PITCH_MAX_ANALYSIS_S = 4.0    # analyze at most the first N seconds of a turn
 # Push-to-talk: "vad" | "ptt" | "both". Ship with "both" — PTT overrides VAD.
 INPUT_MODE = "both"
 
+# Visitor sessions: a quick PTT tap (held under this long) signals "new
+# visitor" instead of being treated as speech — ends whatever session was
+# active and starts a fresh one (see hearing._set_ptt). A normal hold (an
+# actual spoken turn) is unaffected. Starting point only — needs live tuning
+# against how fast real "yes"/"no" replies get held, same as every other
+# timing constant here; too high risks swallowing a genuine short reply as
+# a false session-tap, too low makes the tap hard to hit reliably.
+PTT_TAP_MAX_MS = 300
+
 # Echo / barge-in mitigation (headset mic is the real fix)
 # On an open laptop mic the bot hears its own speaker and barges itself in —
 # VAD barge-in only works with a headset/directional mic. PTT (spacebar)
@@ -87,6 +107,18 @@ BARGE_IN_SUPPRESS_MS = 300     # ignore mic for first N ms of TTS and N ms after
 # ─── Brain (spec 02) ─────────────────────────────────────────────────────────
 
 LLM_BACKEND = "groq"  # "groq" | "ollama" | "canned" — one flag swaps everything
+# Live search for time-sensitive questions ("who is the current PM of X").
+# Tried Groq's own built-in search model first (groq/compound-mini) — it was
+# unreliable (server errors on ~half of search-triggering calls, unrelated to
+# our request) and carried a fixed ~1.2s tax even on success. Replaced with a
+# direct call to Tavily (see brain._tavily_search): real search snippets get
+# folded into the normal GROQ_MODEL request as context, so the model we
+# already trust for speed/reliability does the answering. No TAVILY_API_KEY
+# in .env disables the tier entirely — same "app still works without it"
+# pattern as the Groq key itself. TAVILY_API_KEY_2, _3, ... rotate in on a
+# quota/rate-limit error, same idea as the Groq keys above.
+TAVILY_TIMEOUT_S = 2.5
+TAVILY_MAX_RESULTS = 3
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_FALLBACK = "llama-3.1-8b-instant"  # separate RPD bucket from 70B
 OLLAMA_MODEL = "qwen2.5:0.5b-instruct"  # smallest usable — offline TTFT matters
@@ -158,6 +190,33 @@ Use them sparingly — at most one per reply.
 
 # Spoken once at startup, before the mic opens
 GREETING = "Hey there! I'm Rebotic. [nod] I'm all ears — ask me anything!"
+
+# Visitor sessions (see PTT_TAP_MAX_MS above + main.py's session state
+# machine): spoken directly, not LLM-generated — same reasoning as GREETING
+# being a fixed line. SESSION_NAME_ACK takes the extracted name via .format.
+SESSION_NAME_PROMPT = "Hey! I'm Rebotic. What's your name?"
+SESSION_NAME_RETRY_PROMPT = "Sorry, didn't catch that — what's your name?"
+SESSION_NAME_ACK = "Nice to meet you, {name}! [nod]"
+
+# Special-guest roster (see guests.py) — VIPs get a personalized LLM-generated
+# welcome instead of SESSION_NAME_ACK when their spoken name matches an entry.
+SPECIAL_GUEST_FILE = "special-gest.md"
+# More generous than MAX_TOKENS — this welcome is asked to cover two specific
+# facts (background AND contribution), not just a one-liner, and needs the
+# room to avoid getting cut off mid-sentence.
+SPECIAL_GUEST_MAX_TOKENS = 160
+SPECIAL_GUEST_PROMPT_TEMPLATE = (
+    "A VIP guest has just arrived: {name}, {title}.\n"
+    "Background: {background}\n"
+    "Contribution: {contributions}\n\n"
+    "Give them an especially warm, heartfelt welcome to the expo — more "
+    "ceremonial than your usual casual chat, since this is a VIP moment. "
+    "In 3-4 short sentences: greet them by name and title, mention one "
+    "specific detail from their background, AND mention one specific detail "
+    "from their contribution — both facts must appear, so they feel "
+    "genuinely recognized. Stay warm and friendly, not stiff. One gesture "
+    "tag at most."
+)
 
 # Played the instant speech ends, masks ~800ms of LLM latency
 FILLERS = ["hmm", "let's see", "okay so", "well", "good question", "alright"]
