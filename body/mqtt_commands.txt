@@ -1,0 +1,87 @@
+Rebotic — MQTT Command Reference
+==================================
+Broker: laptop (mosquitto), found via mDNS hostname "aiwix.local"
+Board:  ESP32 "rebotic-arms" (arms.cpp + face.cpp on this board; no jaw/neck/PTT firmware yet)
+
+Topic (subscribe, laptop -> body): rebotic/cmd   (QoS 0)
+Topic (publish,   body -> laptop): rebotic/evt   (QoS 0)  [NOT YET IMPLEMENTED on this board]
+
+Message shape: {"t": "<type>", "v": "<value>"}
+Unknown t or v is ignored silently by firmware (safe to send anything).
+
+
+STATE COMMANDS  (t = "state")  -- handled by arms.cpp (pose) + face.cpp (mouth open/closed)
+--------------------------------------------------------------------------------------------
+mosquitto_pub -t rebotic/cmd -m '{"t":"state","v":"idle"}'
+    -> arms breathe ±3°, eyes blink 3-6s (independent), jaw/mouth closed
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"state","v":"attend"}'
+    -> arms lift ~10°, ease in 200ms (must feel reactive, <300ms)
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"state","v":"thinking"}'
+    -> arms settle down, (eyes pulse amber -- not yet wired to state)
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"state","v":"speak"}'
+    -> mouth opens/tracks amp; arms use ambient talk-sway
+
+
+AMP COMMAND  (t = "amp")  -- handled by face.cpp -> mouth.cpp only (arms ignore it, no jaw on this board)
+--------------------------------------------------------------------------------------------------------
+mosquitto_pub -t rebotic/cmd -m '{"t":"amp","v":0}'      # jaw/mouth closed
+mosquitto_pub -t rebotic/cmd -m '{"t":"amp","v":80}'     # mouth energy 0-255
+mosquitto_pub -t rebotic/cmd -m '{"t":"amp","v":200}'
+mosquitto_pub -t rebotic/cmd -m '{"t":"amp","v":120}'
+mosquitto_pub -t rebotic/cmd -m '{"t":"amp","v":0}'
+    -> stops updating (stale) after 250-300ms with no new amp -> mouth snaps/glides closed
+
+
+GESTURE COMMANDS  (t = "gest")  -- handled by arms.cpp (shrug only on this board)
+----------------------------------------------------------------------------------
+mosquitto_pub -t rebotic/cmd -m '{"t":"gest","v":"shrug"}'
+    -> both arms up ~45°, hold 400ms, drop; one-shot overlay ~700ms; replaces an in-flight gesture
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"gest","v":"nod"}'
+    -> NOT implemented on this board (neck-only, spec 06 -- ignored silently)
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"gest","v":"tilt"}'
+    -> NOT implemented on this board (neck-only, spec 06 -- ignored silently)
+
+
+HARDWARE BRING-UP / CALIBRATION OVERRIDE  (t = "zero")  -- handled by arms.cpp only
+------------------------------------------------------------------------------------
+mosquitto_pub -t rebotic/cmd -m '{"t":"zero","v":"on"}'
+    -> ALL 6 arm servos snap to literal 0°, bypassing cal.base/min/max/mirror -- holds
+       indefinitely (no idle-detach timeout while active). Use only for physical bring-up;
+       watch for a joint stalling against its mechanical stop.
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"zero","v":"off"}'
+    -> exits raw-zero mode, resumes normal state animation
+       (any "state" or "gest" command also exits raw-zero automatically)
+
+
+INPUT EVENTS  (t = "ptt")  -- spec'd on rebotic/evt, body -> laptop -- NOT YET IMPLEMENTED
+--------------------------------------------------------------------------------------------
+mosquitto_sub -t rebotic/evt -v
+    {"t":"ptt","v":"down"}   # PTT button pressed  -> laptop should force speech_start
+    {"t":"ptt","v":"up"}     # PTT button released -> laptop should finalize the turn
+    (No PTT button or publish code exists in net.cpp/arms.cpp yet -- board only subscribes.
+     Laptop-side subscriber for this topic is also not yet wired into hearing.py.)
+
+
+QUICK SMOKE TEST SEQUENCE (from spec 02-firmware.md)
+-------------------------------------------------------
+mosquitto_pub -t rebotic/cmd -m '{"t":"state","v":"attend"}'
+mosquitto_pub -t rebotic/cmd -m '{"t":"gest","v":"nod"}'
+for v in 0 80 200 120 0; do mosquitto_pub -t rebotic/cmd -m "{\"t\":\"amp\",\"v\":$v}"; done
+mosquitto_sub -t rebotic/evt -v    # press the button -> see ptt down/up (once implemented)
+
+mosquitto_pub -t rebotic/cmd -m '{"t":"zero","v":"on"}'
+mosquitto_pub -t rebotic/cmd -m '{"t":"zero","v":"off"}'
+
+
+NOTES
+------
+- All values for "state"/"gest"/"zero" arrive as JSON strings; "amp" arrives as a JSON number
+  (firmware auto-converts either shape to a C string before dispatch).
+- No cmd received for 10s -> firmware forces state=idle on its own (assumes laptop restarted).
+- python robot.py (existing smoke test) exercises the same messages end-to-end.

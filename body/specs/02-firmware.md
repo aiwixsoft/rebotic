@@ -51,6 +51,7 @@ Same contract as the software PROJECT.md — the body implements the receiving s
 | `{"t":"gest","v":"nod"}` | gesture tag | tilt down-up, twice, ~700ms total |
 | `{"t":"gest","v":"tilt"}` | gesture tag | tilt to one side ~15°, hold 400ms, return |
 | `{"t":"gest","v":"shrug"}` | gesture tag | BOTH arms up ~45°, hold 400ms, drop + eyes roll animation |
+| `{"t":"zero","v":"on"}` | hardware bring-up override, **not** part of the software state/gest/amp contract | all 6 arm servos snap to literal 0° (bypasses `cal.base`/min-max/mirror), hold indefinitely — until `{"t":"zero","v":"off"}` or any `state`/`gest` command |
 
 Unknown `t` or `v`: **ignore silently**. The laptop may grow the protocol; old
 firmware must never crash on new messages.
@@ -148,6 +149,10 @@ mosquitto_pub -t rebotic/cmd -m '{"t":"state","v":"attend"}'
 mosquitto_pub -t rebotic/cmd -m '{"t":"gest","v":"nod"}'
 for v in 0 80 200 120 0; do mosquitto_pub -t rebotic/cmd -m "{\"t\":\"amp\",\"v\":$v}"; done
 mosquitto_sub -t rebotic/evt -v    # press the button → see ptt down/up
+
+# hardware bring-up only -- all 6 arm servos to literal 0°, ignoring cal/min/max
+mosquitto_pub -t rebotic/cmd -m '{"t":"zero","v":"on"}'
+mosquitto_pub -t rebotic/cmd -m '{"t":"zero","v":"off"}'   # or any state/gest command
 ```
 
 `python robot.py` (existing smoke test) exercises the same messages end-to-end.

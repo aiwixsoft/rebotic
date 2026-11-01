@@ -42,8 +42,25 @@ static void mqttCallback(char* topic, byte* payload, unsigned int length) {
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) return;                       // malformed -> ignore silently
   const char* t = doc["t"];
-  const char* v = doc["v"];
-  if (!t || !v) return;                  // missing fields -> ignore silently
+  if (!t) return;                        // missing field -> ignore silently
+
+  // "v" arrives as a JSON string for state/gest ("idle", "shrug", ...) but
+  // as a JSON *number* for amp (0-255). ArduinoJson's as<const char*>()
+  // only returns non-null for an actual stored string -- for a number it's
+  // NULL, which used to make every amp message silently fail the old
+  // `if (!t || !v) return` check before it ever reached onCommand(). Handle
+  // both shapes here so every handler downstream can keep treating v as a
+  // plain C string regardless of which JSON type it arrived as.
+  char vBuf[16];
+  const char* v;
+  if (doc["v"].is<const char*>()) {
+    v = doc["v"].as<const char*>();
+  } else if (doc["v"].is<int>()) {
+    snprintf(vBuf, sizeof(vBuf), "%d", doc["v"].as<int>());
+    v = vBuf;
+  } else {
+    return;                              // missing/unsupported v type -> ignore silently
+  }
 
   lastCmdMillis = millis();
   if (onCommand) onCommand(t, v);

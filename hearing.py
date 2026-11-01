@@ -63,6 +63,15 @@ class Hearing:
         # bounded — drop frames under load instead of growing for 6 hours
         self._frames: asyncio.Queue = asyncio.Queue(maxsize=256)
 
+        # Monotonic per-utterance counter. _publish_online runs in the
+        # background and can take up to STT_ONLINE_TIMEOUT_S to publish its
+        # `final` — long enough for a newer utterance's reply to already be
+        # playing by the time an older one's lookup finishes. Tagging each
+        # final with the turn_id it belongs to lets main.py drop a stale one
+        # instead of using it to interrupt a newer, already-started reply.
+        self._turn_id = 0
+        self._cur_turn_id = 0
+
         # VAD state machine
         self._speaking = False
         self._ptt_down = False
@@ -244,6 +253,8 @@ class Hearing:
 
     def _enter_speaking(self) -> None:
         self._speaking = True
+        self._turn_id += 1
+        self._cur_turn_id = self._turn_id
         self._on_count = 0
         self._silence_ms = 0.0
         self._speech_ms = 0.0
@@ -325,6 +336,7 @@ class Hearing:
 
     def _finalize(self) -> None:
         cfg = self.cfg
+        turn_id = self._cur_turn_id
         self._speaking = False
         tail = json.loads(self._rec.FinalResult()).get("text", "")
         self._rec.Reset()  # missing this leaks state across turns
@@ -351,9 +363,9 @@ class Hearing:
             text = text[:cfg.MAX_TRANSCRIPT_CHARS]
 
         if audio is not None and health.ok:
-            asyncio.create_task(self._publish_online(text, gender, audio))
+            asyncio.create_task(self._publish_online(text, gender, audio, turn_id))
         else:
-            self.bus.publish(events.final(text, gender))
+            self.bus.publish(events.final(text, gender, turn_id))
 
     def _cancel_as_tap(self) -> None:
         """A quick PTT tap (<PTT_TAP_MAX_MS, see _set_ptt) signals 'new
@@ -370,7 +382,7 @@ class Hearing:
         self._silence_ms = 0.0
         self.bus.publish(events.new_session())
 
-    async def _publish_online(self, fallback_text: str, gender: str, pcm: bytes) -> None:
+    async def _publish_online(self, fallback_text: str, gender: str, pcm: bytes, turn_id: int) -> None:
         """Vosk's transcript already shipped as `fallback_text` — try to beat it
         with Groq Whisper before the event goes out. A miss costs nothing but
         the timeout; the turn always gets a transcript, never silence."""
@@ -385,7 +397,7 @@ class Hearing:
             health.mark_down()
         if len(text) > self.cfg.MAX_TRANSCRIPT_CHARS:
             text = text[:self.cfg.MAX_TRANSCRIPT_CHARS]
-        self.bus.publish(events.final(text, gender))
+        self.bus.publish(events.final(text, gender, turn_id))
 
     async def _transcribe_online(self, pcm: bytes) -> str:
         buf = io.BytesIO()

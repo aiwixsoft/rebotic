@@ -35,6 +35,13 @@ class Rebotic:
 
         self._speak_task: asyncio.Task | None = None
         self._interrupted = False
+        # Guards against a stale `final` — hearing.py's online-STT lookup is
+        # backgrounded and can take up to STT_ONLINE_TIMEOUT_S, long enough for
+        # a newer utterance's reply to already be playing by the time an older
+        # one's lookup finishes. Only ever act on a final whose turn_id is the
+        # newest seen; an older, late-arriving one is dropped instead of
+        # incorrectly interrupting the newer reply already in progress.
+        self._latest_turn_id = 0
         # Visitor sessions (PTT tap, see hearing.py's _cancel_as_tap)
         self._awaiting_name = False
         self._name_attempts = 0
@@ -100,6 +107,15 @@ class Rebotic:
             elif ev.type == "new_session":
                 self._start_new_session()
             elif ev.type == "final":
+                turn_id = ev.data.get("turn_id", 0)
+                if turn_id < self._latest_turn_id:
+                    # a backgrounded online-STT lookup for an older utterance
+                    # finally resolved after a newer reply already started —
+                    # drop it rather than let it interrupt the newer one.
+                    log.debug("dropping stale final (turn %d behind %d): %r",
+                              turn_id, self._latest_turn_id, ev.data["text"])
+                    continue
+                self._latest_turn_id = turn_id
                 text = ev.data["text"]
                 gender = ev.data.get("gender", "unknown")
                 self.voice.set_gender(gender)  # unknown keeps the current voice

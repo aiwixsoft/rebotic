@@ -63,7 +63,13 @@ VOSK_MODEL_PATH = "models/vosk-model-small-en-us-0.15"
 # transcript when it lands in time. Vosk still runs unconditionally (partials,
 # turn-taking heuristic, gender pitch) and is the instant fallback on a miss.
 # Empty model = tier disabled, hearing.py behaves exactly as Vosk-only.
-STT_ONLINE_MODEL = "whisper-large-v3-turbo"
+STT_ONLINE_MODEL = ""  # disabled: Groq Whisper's cold-start latency on this
+                        # account/region (~8s, measured) blew past the 2.5s
+                        # budget on nearly every turn, so it was falling back
+                        # to Vosk almost always anyway while still costing the
+                        # full timeout in delay each time. Vosk-only is faster
+                        # in practice here. Re-enable with "whisper-large-v3-turbo"
+                        # if Groq's cold-start latency improves.
 STT_ONLINE_LANGUAGE = "en"
 STT_ONLINE_TIMEOUT_S = 2.5   # a miss falls back to the Vosk transcript AND trips the breaker
 STT_ONLINE_MAX_S = 15        # safety cap on buffered turn audio; VAD ends turns long before this
@@ -107,6 +113,8 @@ BARGE_IN_SUPPRESS_MS = 300     # ignore mic for first N ms of TTS and N ms after
 # ─── Brain (spec 02) ─────────────────────────────────────────────────────────
 
 LLM_BACKEND = "groq"  # "groq" | "ollama" | "canned" — one flag swaps everything
+# "groq" auto-falls back to Ollama per-turn on any cloud failure and
+# auto-recovers via the health probe once the network/model is fixed.
 # Live search for time-sensitive questions ("who is the current PM of X").
 # Tried Groq's own built-in search model first (groq/compound-mini) — it was
 # unreliable (server errors on ~half of search-triggering calls, unrelated to
@@ -119,8 +127,8 @@ LLM_BACKEND = "groq"  # "groq" | "ollama" | "canned" — one flag swaps everythi
 # quota/rate-limit error, same idea as the Groq keys above.
 TAVILY_TIMEOUT_S = 2.5
 TAVILY_MAX_RESULTS = 3
-GROQ_MODEL = "llama-3.3-70b-versatile"
-GROQ_FALLBACK = "llama-3.1-8b-instant"  # separate RPD bucket from 70B
+GROQ_MODEL = "openai/gpt-oss-120b"  # Groq deprecated llama-3.3-70b-versatile 2026-06-17
+GROQ_FALLBACK = "openai/gpt-oss-20b"  # deprecated llama-3.1-8b-instant; separate RPD bucket from 120B
 OLLAMA_MODEL = "qwen2.5:0.5b-instruct"  # smallest usable — offline TTFT matters
                                         # more than eloquence (1.5b took 7-12s/turn)
 OLLAMA_URL = "http://localhost:11434"

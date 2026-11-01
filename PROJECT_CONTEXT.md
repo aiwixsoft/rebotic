@@ -6,7 +6,7 @@
 > real architecture, conventions, and constraints. Paste this whole file into a chat to
 > give that assistant full context. It documents both the **software** (Python, on a
 > laptop) and the **hardware** (ESP32 robot body) halves, including which hardware parts
-> are *specified* vs. *actually built* as of this writing (2026-08-22).
+> are *specified* vs. *actually built* as of this writing (2026-08-25).
 >
 > If you're an AI reading this to help write code for this project: match the existing
 > style — no unnecessary abstractions, heavy inline comments explaining *why* (not what),
@@ -119,17 +119,23 @@ rebotic/
         ├── Rebotic.ino              # setup()/loop() wiring only
         ├── config.h                 # pins, servo calibration, WiFi/MQTT/timing constants
         ├── net.h / net.cpp          # WiFi (WiFiManager portal) + MQTT (mDNS broker lookup)
-        └── arms.h / arms.cpp        # the 6-servo arm gesture/animation engine
+        ├── arms.h / arms.cpp        # the 6-servo arm gesture/animation engine
+        ├── face.h / face.cpp        # thin orchestrator: one shared FreeRTOS task drives eyes+mouth
+        ├── eyes.h / eyes.cpp        # 2x SSD1306 OLED — static sclera, wandering pupil
+        └── mouth.h / mouth.cpp      # 1x SSD1306 OLED — free-running "always talking" lip animation
 ```
 
 **Important nuance:** the `body/specs/06-neck-motion.md` and `07-arms-motion.md` files
 are *design specs*, and the actual firmware in `body/Rebotic/` currently implements
-**only the arms** (`arms.h/.cpp`, 6 servos: shoulder-lift, shoulder-rotate, elbow ×2
-sides). The neck (pan/tilt, GPIO 14/27) is specified but **not yet wired into this
+**the arms** (`arms.h/.cpp`, 6 servos: shoulder-lift, shoulder-rotate, elbow ×2 sides)
+**and a 3-OLED face** (`face.h/.cpp` + `eyes.h/.cpp` + `mouth.h/.cpp`, see §6.4/§6.8).
+The neck (pan/tilt, GPIO 14/27) is specified but **not yet wired into this
 firmware** — those GPIOs are explicitly reserved and left alone in `config.h`. If asked
 to "add the neck to the firmware," the task is to merge spec 06's behavior into the
 existing `net.h`/`arms.h` pattern (a new `neck.h/.cpp` module + wiring it into
-`Rebotic.ino`'s `armsOnCommand`/`armsTick` calls), not to build from scratch.
+`Rebotic.ino`'s `onNetCommand`/`loop()` calls), not to build from scratch. Note the
+jaw-servo idea from the original parts-list rev 2 removal (§6.3) has effectively been
+superseded by the mouth OLED — there is still no physical jaw, but there is now a mouth.
 
 ---
 
@@ -500,17 +506,29 @@ This distinction matters a lot for any code-generation request:
 | MQTT contract (`state`/`amp`/`gest`) | **Implemented** on both sides — `robot.py` (laptop) and `net.h/.cpp` (ESP32) |
 | Arms (6 servos: shoulder lift + rotate + elbow, ×2 sides) | **Implemented** — `arms.h/.cpp`, per spec 07 |
 | Neck (pan/tilt, 2 servos) | **Specified only** (spec 06) — GPIOs 14/27 reserved, not yet in firmware |
-| Jaw servo / mouth movement | **Removed from scope** (parts-list rev 2) — replaced conceptually by a future OLED face, not a physical jaw. `amp` is still published and received by firmware but explicitly ignored (no jaw hardware exists) |
+| Jaw servo / mouth movement | **Removed from scope** (parts-list rev 2) as a physical jaw. Superseded by a real **mouth OLED** (`mouth.h/.cpp`) — a free-running, always-animating lip-shape display, **not** driven by the `amp` MQTT value. `amp` is still published by `voice.py` and received by firmware but explicitly ignored (`faceOnCommand`/`armsOnCommand` both no-op on `t=="amp"`) — there is still no code path that makes the face open/close in sync with actual speech amplitude |
 | Hardware PTT button | **Removed from scope** (parts-list rev 2) — push-to-talk stays software-only (spacebar today; `rebotic/evt` glue is future work if a button is ever added back) |
-| Eyes (WS2812B) | **Specified** (spec 02/03), hardware on the parts list — check current firmware for whether LED driving is implemented alongside `arms.cpp` |
+| Eyes (2x SSD1306 OLED, not WS2812B as originally specced) | **Implemented** — `eyes.h/.cpp`: static sclera per eye, a shared wandering pupil (left↔front↔right ping-pong) rendered on both. Not driven by `state`/`gest`/`amp` — purely a free-running idle animation |
+| Face orchestration | **Implemented** — `face.h/.cpp` owns one shared FreeRTOS task that ticks eyes then mouth sequentially every ~1ms; `faceOnCommand()` is an intentional no-op (see §6.8) |
 | WiFi provisioning | **Implemented, dynamic**: `WiFiManager` captive-portal, no hardcoded SSID/password. First boot (or BOOT-button reset) opens an AP named `Rebotic-Setup`; credentials entered via a captive setup page persist to flash |
 | Broker discovery | **Implemented via mDNS**: firmware looks up the laptop's mDNS hostname (`aiwix`, in `config.h`'s `MQTT_BROKER_MDNS_NAME`) rather than a hardcoded IP, so it survives network changes as long as laptop and ESP32 share a LAN |
+
+**Another spec-vs-built divergence, same shape as §2's neck/jaw note:** `body/specs/`
+(02/03) describe the eyes as WS2812B addressable LEDs. The actual built face is three
+small I2C SSD1306 OLED panels (2 eyes + 1 mouth) driven by U8g2, not LEDs at all — the
+specs are stale on this point, `body/Rebotic/eyes.cpp`/`mouth.cpp` are the source of
+truth for what's physically on the robot today.
 
 ### 6.4 Firmware architecture (`body/Rebotic/`)
 
 ```cpp
-Rebotic.ino   // setup(): esp_task_wdt init, netBegin(armsOnCommand), armsBegin()
-              // loop():  esp_task_wdt_reset(), netLoop(), 10s-no-cmd→force-idle check, armsTick(now)
+Rebotic.ino   // setup(): faceBegin() (before netBegin — face must be visible even while
+              //   WiFi/portal blocks), netBegin(onNetCommand), armsBegin(), THEN
+              //   esp_task_wdt_add(NULL) (see WDT note below)
+              // onNetCommand(t, v): fans one net.h callback out to armsOnCommand(t, v)
+              //   AND faceOnCommand(t, v) — net.h only carries one handler slot
+              // loop():  esp_task_wdt_reset(), netLoop(), 10s-no-cmd→force-idle
+              //   (via onNetCommand, not armsOnCommand directly), armsTick(now), faceTick(now)
 config.h      // WiFiManager portal name/timeout, mDNS broker hostname, MQTT topic/client-id,
               // per-servo GPIO pins + ServoCal{base, minAngle, maxAngle, mirror} calibration structs,
               // NO_CMD_TIMEOUT_MS (10s), SERVO_DETACH_IDLE_MS (5s), WDT_TIMEOUT_S (8s)
@@ -519,6 +537,13 @@ net.h/.cpp    // non-blocking WiFi+MQTT connect/reconnect, JSON parse of rebotic
 arms.h/.cpp   // armsBegin() (attach + ease to neutral over ~1s), armsTick(now) (pure function
               // of millis(), drives idle/attend/thinking/speak animation or an in-flight
               // gesture), armsOnCommand(t, v) (handles "state"/"gest", ignores "amp" — no jaw)
+face.h/.cpp   // faceBegin() (eyesBegin()+mouthBegin(), then spawns ONE shared FreeRTOS task
+              // that ticks eyesTick()+mouthTick() sequentially forever); faceTick(now) and
+              // faceOnCommand(t, v) are both deliberate no-ops — see §6.8
+eyes.h/.cpp   // 2x SSD1306 OLED (software I2C, one dedicated SDA/SCL pair each), static
+              // sclera + one shared wandering pupil; dual-core-pinned flush tasks (§6.8)
+mouth.h/.cpp  // 1x SSD1306 OLED (software I2C), free-running "always talking" curved-lip
+              // animation, NOT driven by the amp MQTT value (§6.8)
 ```
 
 Right-side servos physically mirror the left side; a `mirror: true` flag in `ServoCal`
@@ -617,6 +642,7 @@ network communication and two separate software stacks talking a shared protocol
 | `PubSubClient` | The actual MQTT client implementation — connect, subscribe, publish, and the message-received callback plumbing. |
 | `ArduinoJson` (v7) | Parses incoming `rebotic/cmd` JSON payloads into `{t, v}` C strings. |
 | `ESP32Servo` | LEDC (ESP32 hardware PWM peripheral)-backed servo driver — every `Servo.attach()`/`.write()`/`.detach()` call in `arms.cpp` goes through this. |
+| `U8g2` | OLED graphics/driver library for the 3 SSD1306 face panels, used in **software-I2C mode** (bit-banged `digitalWrite`, not the hardware I2C peripheral) — see §6.8 for why. Install via Arduino IDE → Tools → Manage Libraries → "U8g2". |
 | `esp_task_wdt` (ESP-IDF) | Hardware watchdog timer, 8s timeout (`WDT_TIMEOUT_S`) — firmware must call `esp_task_wdt_reset()` every `loop()` iteration or the chip force-reboots. Exists because the firmware runs unattended for hours at an expo. |
 | Arduino `Serial` (115200 baud) | Debug logging only, over the same USB cable used to flash the board — not part of the runtime laptop↔body link (that's WiFi/MQTT). |
 
@@ -625,6 +651,83 @@ WebSockets, no raw TCP/UDP socket protocol, no Bluetooth. MQTT was chosen becaus
 lightweight pub/sub model that matches the "laptop broadcasts intent, body reacts"
 shape exactly, degrades gracefully (QoS 0, no handshake required per message), and
 libraries exist on both the Python and Arduino sides that need almost no glue code.
+
+---
+
+### 6.8 The face subsystem (`face.h/.cpp`, `eyes.h/.cpp`, `mouth.h/.cpp`) — three OLEDs, one shared task
+
+This is the newest piece of the firmware and the one most likely to be misunderstood by
+an AI reading only `config.h`/specs 02/03 (which still describe WS2812B LED eyes — see
+the divergence note in §6.3). What's actually built is **three separate 4-pin I2C
+SSD1306 OLED panels** — two eyes + one mouth — each with its **own dedicated SDA/SCL
+GPIO pair** (right eye 21/22, left eye 18/19, mouth 5/17), all identical hardware at the
+same fixed I2C address, disambiguated purely by which pins each `U8g2` instance bit-bangs.
+
+**Not part of the `state`/`amp`/`gest` MQTT contract.** `faceOnCommand(t, v)` (called
+from `Rebotic.ino`'s new `onNetCommand` fan-out, alongside `armsOnCommand`) is a
+deliberate no-op — the face never reacts to `state` transitions, gestures, or the `amp`
+mouth-sync value `voice.py` publishes at 40Hz. Both eyes and mouth are **free-running**
+animations driven purely by `millis()`: the eyes' pupil ping-pongs left→front→right→
+front→left forever on a smoothed random-hold timer, and the mouth continuously morphs a
+curved-lip gap through a bounded random walk so it always looks like it's talking,
+whether or not the robot is actually speaking. If asked to "sync the mouth to the amp
+value," this is the file (`mouth.cpp`'s `mouthTick`/`updateMouth`) that would need to
+start reading MQTT `amp` — that path does not exist today.
+
+**Why one shared FreeRTOS task drives both eyes and mouth, not one task each:** an
+earlier version gave eyes and mouth independent tasks, each bit-banging its own
+software-I2C bus concurrently. Software I2C isn't safe under arbitrary preemption — one
+task's bit-bang transaction could get interrupted mid-clock-pulse by the other task
+being scheduled in, corrupting frames on one or both displays. `face.cpp`'s single
+`faceAnimTaskFn` calls `eyesTick()` then `mouthTick()` back-to-back every ~1ms tick, so
+only one display is ever mid-transaction at a time. This task is started at the *end* of
+`faceBegin()`, independent of `loop()`, specifically because `setup()` calls the
+(blocking) `netBegin()` right after `faceBegin()` — if the face were driven from
+`loop()`, it would freeze on one frame for however long WiFiManager's captive portal
+blocks (up to `WIFI_PORTAL_TIMEOUT_S` = 600s).
+
+**Why `U8g2` in software-I2C mode, not hardware I2C or `Adafruit_SSD1306`:** the ESP32
+has only 2 hardware I2C peripherals for 3 displays. An earlier version shared one
+hardware peripheral across two panels by re-pointing `Wire1.begin(sda, scl)` to
+different pins at runtime; this silently broke the mouth panel
+(`i2c_master_transmit failed: ESP_ERR_INVALID_STATE`) because the ESP32 core's I2C-NG
+driver tears down and rebuilds the bus's internal handle on every `begin()` call with
+different pins, invalidating whichever other display's handle was already attached.
+`U8g2`'s software-I2C mode bit-bangs each panel's pins directly via plain
+`digitalWrite()` — no shared hardware peripheral, no handle to invalidate, so three
+fully independent instances are safe. This is documented in-code as a specifically
+diagnosed and fixed bug, not a stylistic choice — don't "simplify" it back to hardware
+I2C or a shared bus without re-reading `mouth.cpp`'s comment block.
+
+**Eyes-specific detail — dual-core-pinned flush tasks:** drawing into a display's RAM
+buffer (cheap) and transmitting that buffer over bit-banged I2C (slow) are split apart.
+`eyesTick()` draws both eyes' buffers on the shared face task, then hands off the actual
+transfer to two dedicated tasks pinned to different cores (`eyeFlushTaskR` on core 0,
+`eyeFlushTaskL` on core 1) via a "go" semaphore each, waiting on both "done" semaphores
+before returning. This makes the two eyes' pupils move in the same frame instead of one
+visibly lagging the other by however long its own transfer takes, and also guarantees
+the next frame's draw can't start until both in-flight transfers finish (no tearing).
+Only the small tile region covering the pupil's travel range is re-flushed per frame
+(`updateDisplayArea`, not a full `sendBuffer()`) since the sclera never changes — this
+keeps each core's transfer short on top of already running concurrently. Both eyes'
+`random()` calls happen only from the one shared face task (never from the per-core
+flush tasks), because Arduino's `random()` generator state isn't reentrant across tasks.
+
+**The ESP32 watchdog interaction (`Rebotic.ino`'s `setup()`) — read this before touching
+boot order.** `esp_task_wdt_add(NULL)` (subscribing the main task to the 8s hardware
+watchdog) was moved to happen **after** `faceBegin()`/`netBegin()`/`armsBegin()`, not
+before. Reason, found the hard way: `netBegin()` blocks — sometimes past 8 seconds —
+on WiFiManager's saved-network retry and (if that fails) its captive-portal AP, and
+nothing feeds the watchdog while a blocking call is running. Subscribing the task before
+that finished caused the watchdog to force-reboot the board mid-connect, repeatedly,
+which from the outside looked like intermittent, unexplained resets — "the face
+appearing then vanishing every few seconds." The fix: `faceBegin()` runs first (so the
+face is visible immediately regardless of how long WiFi takes), then `netBegin()`/
+`armsBegin()` still run without WDT supervision, and only once `setup()`'s blocking work
+is fully done does `esp_task_wdt_add(NULL)` subscribe the loop task — from that point on,
+`loop()`'s per-iteration `esp_task_wdt_reset()` keeps it fed as designed. If you add
+another blocking call to `setup()` in the future, it must go *before* this
+`esp_task_wdt_add(NULL)` line, not after.
 
 ---
 
@@ -930,8 +1033,9 @@ each file defines them.
 
 | Function | Signature | What it does |
 |---|---|---|
-| `setup` | `()` | Arduino entry point, runs once at boot: starts `Serial` (115200 baud), configures and initializes the hardware watchdog (`esp_task_wdt`, 8s timeout, retargeting an already-initialized watchdog if one exists), subscribes the current (loop) task to it, then calls `netBegin(armsOnCommand)` (connects WiFi/MQTT, wires `armsOnCommand` as the command handler) followed by `armsBegin()` (attaches and eases all 6 servos to their neutral pose). |
-| `loop` | `()` | Arduino main loop, runs continuously: pets the watchdog, services WiFi/MQTT (`netLoop()`), checks whether no command has arrived in `NO_CMD_TIMEOUT_MS` (10s) — if so, forces the arm state to `idle` exactly once (guards against repeatedly re-forcing every iteration) on the theory the laptop probably restarted or the link dropped — and finally calls `armsTick(now)` to advance whatever animation/gesture is currently in progress. |
+| `onNetCommand` (static) | `(const char* t, const char* v)` | The single handler registered with `netBegin` — `net.h` only carries one handler slot, but both `arms.cpp` and `face.cpp` need every `rebotic/cmd` message, so this just calls `armsOnCommand(t, v)` then `faceOnCommand(t, v)` in turn (the latter is currently a no-op — see §6.8). |
+| `setup` | `()` | Arduino entry point, runs once at boot: starts `Serial` (115200 baud), configures the hardware watchdog config struct (`esp_task_wdt`, 8s timeout, retargeting an already-initialized watchdog if one exists) but does **not** yet subscribe the current task to it; calls `faceBegin()` first (so the face is visible immediately regardless of how long WiFi setup takes), then `netBegin(onNetCommand)` (connects WiFi/MQTT — this can block past the watchdog's own timeout, which is exactly why subscription is deferred) and `armsBegin()` (attaches and eases all 6 servos to their neutral pose); only once all of that blocking work has returned does it call `esp_task_wdt_add(NULL)` to subscribe the loop task. See §6.8 for the reboot bug this ordering fixes. |
+| `loop` | `()` | Arduino main loop, runs continuously: pets the watchdog, services WiFi/MQTT (`netLoop()`), checks whether no command has arrived in `NO_CMD_TIMEOUT_MS` (10s) — if so, forces the arm (and face, via `onNetCommand`) state to `idle` exactly once (guards against repeatedly re-forcing every iteration) on the theory the laptop probably restarted or the link dropped — then calls `armsTick(now)` to advance whatever animation/gesture is currently in progress, and `faceTick(now)` (a no-op; the face animates on its own background task, see §6.8). |
 
 ### Firmware — `body/Rebotic/net.h` / `net.cpp` (WiFi + MQTT transport)
 
@@ -963,7 +1067,35 @@ each file defines them.
 | `armsTickGesture` (static) | `(unsigned long now) -> bool` | Advances the in-flight `shrug` gesture by one tick. For each joint, computes its own staggered elapsed time (shoulder leads; rotate and elbow trail by their configured offsets) through four phases — anticipation dip, ease-out-back strike to the shrug pose, a hold, then an ease-in-out return to the pose the gesture started from — blends in that joint's ongoing breathe offset, and writes the result. Returns whether *any* joint is still mid-gesture (the caller uses this to know when the gesture has fully finished). |
 | `armsBegin` | `()` | Public boot function, called once from `setup()` after `netBegin()`. Attaches all servos, then blocking-eases every joint from the SG90's known power-on center (90°) to its calibrated resting pose over ~1 second (the only safe way to move from an *unknown* physical starting angle without a jump), then initializes the state machine into `STATE_IDLE`. |
 | `armsTick` | `(unsigned long now)` | Public per-`loop()`-iteration function. First enforces the idle-detach safety timer (detaches all servos if no motion demand for `SERVO_DETACH_IDLE_MS` and no gesture is active; re-attaches on the next demand). If a gesture is active, advances it via `armsTickGesture` and clears the gesture-active flag once it reports finished. Otherwise, advances the current state's eased transition (with the same per-joint stagger concept, scaled down for faster response) toward that state's target pose, blended with the ongoing breathe sway, for every joint. |
-| `armsOnCommand` | `(const char* t, const char* v)` | Public MQTT command handler, registered with `netBegin`. Refreshes the "last motion demand" timestamp on any recognized command (keeps servos attached). For `t == "state"`: maps the string value to an `ArmState` enum (unknown values ignored silently) and, if it's actually a change (or servos aren't currently attached), starts a new eased transition from each joint's current angle. For `t == "gest"`: only `"shrug"` is implemented (nod/tilt are neck-only, not built on this board) — starts the gesture, rolling fresh random amplitude/duration jitter (±10%/±15%) for this one instance so no two shrugs look identical, and snapshots each joint's current angle as the gesture's starting point. `t == "amp"` and any other unrecognized `t`/`v` are silently ignored (no jaw exists on this board; unknown values must never crash old firmware talking to a newer laptop protocol). |
+| `armsOnCommand` | `(const char* t, const char* v)` | Public MQTT command handler, registered with `netBegin` (via `onNetCommand`, see above). Refreshes the "last motion demand" timestamp on any recognized command (keeps servos attached). For `t == "state"`: maps the string value to an `ArmState` enum (unknown values ignored silently) and, if it's actually a change (or servos aren't currently attached), starts a new eased transition from each joint's current angle. For `t == "gest"`: only `"shrug"` is implemented (nod/tilt are neck-only, not built on this board) — starts the gesture, rolling fresh random amplitude/duration jitter (±10%/±15%) for this one instance so no two shrugs look identical, and snapshots each joint's current angle as the gesture's starting point. `t == "amp"` and any other unrecognized `t`/`v` are silently ignored (no jaw exists on this board; unknown values must never crash old firmware talking to a newer laptop protocol). |
+
+### Firmware — `body/Rebotic/face.h` / `face.cpp` (shared eyes+mouth animation orchestrator)
+
+| Function | Signature | What it does |
+|---|---|---|
+| `faceAnimTaskFn` (static) | `(void *arg)` | The body of the one shared FreeRTOS task (see §6.8 for why it's one task, not two): forever, calls `eyesTick(millis())` then `mouthTick(millis())` back-to-back and yields for 1 tick (`vTaskDelay(pdMS_TO_TICKS(1))`). Runs independently of `loop()`. |
+| `faceBegin` | `()` | Public boot function, called once from `setup()`, **before** `netBegin()`. Calls `eyesBegin()` and `mouthBegin()` to draw each panel's resting frame, then spawns `faceAnimTaskFn` as a background task (`xTaskCreate`, priority 1, 4096-byte stack) so the face starts animating immediately regardless of how long the subsequent (blocking) WiFi connect takes. |
+| `faceTick` | `(unsigned long now)` | Public per-`loop()`-iteration function — intentionally a no-op. Eyes and mouth animate entirely on the background task started in `faceBegin()`; nothing needs to happen here. |
+| `faceOnCommand` | `(const char* t, const char* v)` | Public MQTT command handler, registered (via `onNetCommand`) alongside `armsOnCommand` — intentionally a no-op. The face never reacts to `state`/`amp`/`gest`; both eyes and mouth are free-running animations regardless of what the robot is doing. |
+
+### Firmware — `body/Rebotic/eyes.h` / `eyes.cpp` (2x SSD1306 OLED — static sclera, wandering pupil)
+
+| Function | Signature | What it does |
+|---|---|---|
+| `drawEye` (static) | `(U8G2_SSD1306_128X64_NONAME_F_SW_I2C &d, int16_t offsetX, int16_t offsetY) -> void` | Draws one eye's full frame into that display's in-RAM buffer only (no I2C transfer here): clears, draws the fixed rounded-box sclera, then draws the pupil as a disc at the given offset from center. |
+| `eyeFlushTaskR` / `eyeFlushTaskL` (static) | `(void *arg)` | The two dedicated, core-pinned tasks (R on core 0, L on core 1) that do nothing but wait on their own "go" semaphore, transmit just the pupil's tile region (`updateDisplayArea`) for their display, then signal their "done" semaphore. Exist so both eyes' slow bit-banged I2C transfers happen concurrently in hardware rather than one after another — see §6.8. |
+| `updateEyes` (static) | `(int16_t offsetX, int16_t offsetY)` | Deduplicates against the last-drawn offset (skips all work if unchanged), otherwise redraws both eyes' buffers via `drawEye`, signals both flush tasks' "go" semaphores, then blocks on both "done" semaphores before returning — guarantees the next frame's draw can't start until both in-flight transfers finish (no tearing). |
+| `eyesBegin` | `()` | Public boot function, called once from `faceBegin()`. Seeds `random()` from a floating analog pin, starts both `U8g2` software-I2C instances, draws and fully sends (`sendBuffer()`, not the tile-only path) each eye's initial centered-pupil frame directly, then creates the semaphores and the two core-pinned flush tasks. |
+| `eyesTick` | `(unsigned long now)` | Public per-face-task-tick function, throttled to `EYE_FRAME_MS` (~50fps). On a look-hold timer expiring, ping-pongs the pupil's target through left→front→right→front→left (`kLookX`/`lookIdx`/`lookDir`) with a small random vertical jitter and a randomized hold duration; every call exponentially glides the actual offset toward the current target (`EYE_LOOK_SMOOTH`) and calls `updateEyes` with the rounded result. |
+
+### Firmware — `body/Rebotic/mouth.h` / `mouth.cpp` (1x SSD1306 OLED — free-running "always talking" mouth)
+
+| Function | Signature | What it does |
+|---|---|---|
+| `renderMouth` (static) | `(int16_t gap)` | Draws and fully sends one frame: two mirrored parabolic-arc lip strokes that always meet at both corners of the mouth and bulge apart at the center by `gap`, giving a curved-lens mouth shape rather than two flat bars. |
+| `updateMouth` (static) | `(int16_t gap)` | Dedup wrapper — only calls `renderMouth` (and its `sendBuffer()` I2C transfer) if the quantized gap actually changed since last call, so a steady gap never re-flickers the display. |
+| `mouthBegin` | `()` | Public boot function, called once from `faceBegin()`. Seeds `random()` from a floating analog pin, starts the `U8g2` software-I2C instance, and draws the resting (near-closed) mouth shape. |
+| `mouthTick` | `(unsigned long now)` | Public per-face-task-tick function, throttled to `FRAME_MS` (effectively as fast as the panel's I2C can keep up). Every call, picks a new small random step from the current gap (bounded random walk, clamped to `[MOUTH_GAP_MIN, MOUTH_GAP_MAX]`), glides most of the way toward it (`MOUTH_SMOOTH`), and calls `updateMouth` — since the target re-rolls every tick, the mouth never actually settles, reading as continuous "always talking" chatter regardless of whether the robot is actually speaking. |
 
 ---
 
@@ -982,4 +1114,5 @@ each file defines them.
 | Breaker (circuit breaker) | `nethealth.py`'s shared online/offline flag, tripped by any cloud call failure |
 | Gesture tag | `[nod]`/`[tilt]`/`[shrug]` inline in LLM output, stripped before speech, sent to the robot body |
 | Clause chunking | Splitting the LLM token stream into whole-sentence chunks for TTS, enabling speak-while-generating |
-| Amp / mouth-sync | RMS-derived 0-255 value published at 40Hz, driving the robot's jaw servo (spec) in time with audio |
+| Amp / mouth-sync | RMS-derived 0-255 value published at 40Hz. Originally specced to drive a jaw servo; no jaw exists in the current build, and the mouth OLED that replaced it does **not** read this value either — it animates independently (see §6.8) |
+| SSD1306 / OLED face panels | The 3 small I2C OLED displays (2 eyes + 1 mouth) that are the actual, currently-built face hardware — see §6.8. Supersedes the older WS2812B-LED-eyes idea still described in `body/specs/`. |

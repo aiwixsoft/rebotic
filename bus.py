@@ -26,10 +26,14 @@ def partial(text: str) -> Event:
     return Event("partial", {"text": text})
 
 
-def final(text: str, gender: str = "unknown") -> Event:
+def final(text: str, gender: str = "unknown", turn_id: int = 0) -> Event:
     """Finalized user turn — triggers the brain. gender is a pitch-based
-    guess ("male"/"female"/"unknown") used to match the TTS voice."""
-    return Event("final", {"text": text, "gender": gender})
+    guess ("male"/"female"/"unknown") used to match the TTS voice. turn_id
+    is a monotonically increasing per-utterance counter (set by hearing.py)
+    so main.py can discard a late-arriving final from an older utterance's
+    backgrounded online-STT lookup instead of letting it interrupt a newer,
+    already-in-progress reply."""
+    return Event("final", {"text": text, "gender": gender, "turn_id": turn_id})
 
 
 def barge_in() -> Event:

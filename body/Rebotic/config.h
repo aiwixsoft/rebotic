@@ -27,14 +27,21 @@
 #define MQTT_TOPIC_CMD   "rebotic/cmd"   // subscribe: laptop -> body
 
 // ─── Arm servo pins (spec 07) ───────────────────────────────────────────────
-// Reserved, do not reuse when the neck (spec 06) is merged onto this board:
-// GPIO 14 (neck pan), GPIO 27 (neck tilt).
+// Left elbow repurposed as neck pan (PIN_NECK_PAN below). Shoulder-rotate
+// is hard-frozen in firmware pending an open jitter investigation (arms.cpp).
+// GPIO 27 reserved for a possible future neck-tilt servo (spec 06; only
+// pan is actually built).
 #define PIN_L_SHOULDER_LIFT   26
 #define PIN_L_SHOULDER_ROTATE 33
-#define PIN_L_ELBOW           4
 #define PIN_R_SHOULDER_LIFT   32
 #define PIN_R_SHOULDER_ROTATE 13
 #define PIN_R_ELBOW           16
+
+// ─── Neck servo pin (spec 06, pan-only) ────────────────────────────────────
+// Spec 06 originally put pan on GPIO 14; instead this reuses the removed
+// L_ELBOW's pin (GPIO 4) so no ESP32-side rewiring is needed -- just move
+// the physical servo from the elbow mount to the neck pan mount.
+#define PIN_NECK_PAN 4
 
 // ─── Servo calibration (placeholders — set these during bring-up, see
 // specs/07-arms-motion.md "Bring-up") ───────────────────────────────────────
@@ -46,15 +53,18 @@ struct ServoCal {
   bool    mirror;   // true: angle is mapped as (180 - angle) before writing
 };
 
-// Right arm mirrors the left physically; if a joint moves the wrong
-// direction on first power-up, flip its `mirror` flag here rather than
-// rewiring.
-static const ServoCal CAL_L_SHOULDER_LIFT   = {90, 40, 150, false};
+// Right arm mirrors the left; flip `mirror` here, not by rewiring, if a
+// joint moves the wrong way. Lift base is 12 (not 0) to stay off the
+// mechanical floor -- sitting a loaded joint right at a hard stop buzzes.
+static const ServoCal CAL_L_SHOULDER_LIFT   = {12, 0, 150, false};
 static const ServoCal CAL_L_SHOULDER_ROTATE = {90, 30, 150, false};
-static const ServoCal CAL_L_ELBOW           = {100, 60, 150, false};
-static const ServoCal CAL_R_SHOULDER_LIFT   = {90, 40, 150, false};
+static const ServoCal CAL_R_SHOULDER_LIFT   = {12, 0, 150, false};
 static const ServoCal CAL_R_SHOULDER_ROTATE = {90, 30, 150, true};
-static const ServoCal CAL_R_ELBOW           = {100, 60, 150, true};
+static const ServoCal CAL_R_ELBOW           = {100, 90, 150, true};
+
+// Neck pan -- placeholder like the others above, calibrate during bring-up.
+// base=90 is dead-center/looking-forward; +-60deg of travel each side.
+static const ServoCal CAL_NECK_PAN          = {90, 30, 150, false};
 
 // ─── Timing / fail-safe (spec 02) ──────────────────────────────────────────
 #define NO_CMD_TIMEOUT_MS    10000  // no cmd this long -> force state=idle

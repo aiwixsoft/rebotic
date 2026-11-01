@@ -356,6 +356,14 @@ class Brain:
                     async for token in self._groq_stream(key_idx, model, messages, max_tokens):
                         started = True
                         yield token
+                    if not started:
+                        # Stream ended clean but produced zero visible content —
+                        # e.g. a reasoning model (gpt-oss) burning the whole
+                        # max_tokens budget on hidden reasoning. A quiet "success"
+                        # here would violate "never silent" (see module docstring):
+                        # try the next key/model instead of returning empty-handed.
+                        log.warning("groq key%d %s returned no content — trying next", key_idx + 1, model)
+                        continue
                     self.last_provider = f"groq:{model} key{key_idx + 1}"
                     return
                 except _NETWORK_ERRORS as e:
@@ -402,6 +410,9 @@ class Brain:
                 stream=True,
                 max_tokens=max_tokens or self.cfg.MAX_TOKENS,  # latency guard + quota conservation
                 temperature=self.cfg.TEMPERATURE,
+                reasoning_effort="low",  # gpt-oss models spend max_tokens on hidden
+                                         # reasoning first — "low" leaves room in our
+                                         # tight budget for an actual visible answer
             ),
             timeout=self.cfg.GROQ_TIMEOUT_S,
         )
