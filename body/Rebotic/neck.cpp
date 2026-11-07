@@ -1,73 +1,86 @@
+// Strict port of sholderNeck.ino's servo3 (neck, pin 4) -- literal
+// NECK_MIN/MAX, literal per-state angles, literal nod gesture, same
+// cosine easing, made non-blocking.
 #include "neck.h"
 #include "config.h"
 #include <ESP32Servo.h>
 #include <math.h>
 #include <string.h>
 
-enum NeckState { NECK_IDLE, NECK_ATTEND, NECK_THINKING, NECK_SPEAK };
+enum NeckState { NECK_IDLE, NECK_SPEAK };   // only 2 states, per explicit request
 
 static Servo panServo;
 static bool attached = false;
-static float currentAngle = 90.0f;   // follower state, pose only (no sway)
-static unsigned long lastTickMillis = 0;
-static unsigned long lastMotionDemandMillis = 0;
+static float currentAngle = 0.0f;
 static NeckState currentState = NECK_IDLE;
 
-// Same speed-limited follower as arms.cpp uses (see that file's comment for
-// the full reasoning: a fixed-duration eased curve reads mechanical and can
-// jump if a tick is late; this nudges toward the target every tick, capped
-// at a max speed, decelerating smoothly into rest). Kept as its own small
-// copy rather than a shared header -- neck and arms are independent modules
-// by design (spec 06/07), and this is only a few lines.
-static const float FOLLOW_MAX_DEG_PER_SEC = 60.0f;
-static const float FOLLOW_TIME_CONSTANT_S = 0.30f;
+// ─── literal sholderNeck.ino constants ─────────────────────────────────────
+static const float NECK_MIN = 0.0f;
+static const float NECK_MAX = 20.0f;
+static const float IDLE_ANGLE  = 0.0f;
+static const float SPEAK_ANGLE = 10.0f;
+static const unsigned long MOVE_MS = 250;   // pose transition -- fast, so return-to-rest reads as immediate
+static const unsigned long LEG_MS  = 500;   // one leg of the nod gesture
 
-static float approach(float current, float target, float dt) {
-  if (dt <= 0.0f) return current;
-  float step = (target - current) * (1.0f - expf(-dt / FOLLOW_TIME_CONSTANT_S));
-  float maxStep = FOLLOW_MAX_DEG_PER_SEC * dt;
-  step = constrain(step, -maxStep, maxStep);
-  return current + step;
-}
-
-// idle and speak both get the same gentle ambient sway (spec 06: speak
-// "hold the attend pose + idle-style breathe sway underneath" -- the neck
-// doesn't need dedicated speech choreography). attend/thinking hold dead
-// still, same "reactive, settled" pattern arms.cpp uses.
-struct Sway { float ampDeg, hz; };
-static Sway swayFor(NeckState s) {
-  if (s == NECK_IDLE || s == NECK_SPEAK) return { 10.0f, 0.2f };
-  return { 0.0f, 0.0f };
-}
-
-static float swayAngle(unsigned long now) {
-  Sway s = swayFor(currentState);
-  if (s.ampDeg <= 0.0f) return 0.0f;
-  float headroom = min((float)CAL_NECK_PAN.base - (float)CAL_NECK_PAN.minAngle,
-                        (float)CAL_NECK_PAN.maxAngle - (float)CAL_NECK_PAN.base);
-  float amp = min(s.ampDeg, max(0.0f, headroom));
-  float phase = (now / 1000.0f) * TWO_PI * s.hz;
-  return sinf(phase) * amp;
+static float easeInOutCosine(float t) {
+  return 0.5f - 0.5f * cosf(PI * t);   // sholderNeck.ino's exact easing formula
 }
 
 static void writeAngle(float angle) {
-  float out = CAL_NECK_PAN.mirror ? (180.0f - angle) : angle;
-  out = constrain(out, (float)CAL_NECK_PAN.minAngle, (float)CAL_NECK_PAN.maxAngle);
-  panServo.write((int)roundf(out));
+  currentAngle = constrain(angle, NECK_MIN, NECK_MAX);
+  panServo.write((int)roundf(currentAngle));
+}
+
+// Non-blocking replacement for easeTo(): same cosine curve, sampled per
+// tick from elapsed time instead of looped with delay().
+struct Ease1 { float from, to; unsigned long start, durationMs; bool active; };
+static Ease1 poseEase = {0, 0, 0, 0, false};
+
+static void startPoseEase(float target, unsigned long durationMs) {
+  poseEase = { currentAngle, target, millis(), durationMs, true };
+}
+
+static void tickPoseEase(unsigned long now) {
+  if (!poseEase.active) return;
+  unsigned long elapsed = now - poseEase.start;
+  if (elapsed >= poseEase.durationMs) {
+    writeAngle(poseEase.to);
+    poseEase.active = false;
+    return;
+  }
+  float eased = easeInOutCosine((float)elapsed / poseEase.durationMs);
+  writeAngle(poseEase.from + (poseEase.to - poseEase.from) * eased);
+}
+
+static float targetFor(NeckState s) {
+  return (s == NECK_SPEAK) ? SPEAK_ANGLE : IDLE_ANGLE;
+}
+
+// ─── gest "nod" -- literal gestureNod ───────────────────────────────────────
+// Two legs (dip to NECK_MAX, then straight back, no hold), 500ms each,
+// cosine-eased -- exact shape/timing from the reference file.
+static bool nodActive = false;
+static unsigned long nodStart = 0;
+static float nodFromAngle = 0;
+
+static bool tickNod(unsigned long now) {
+  unsigned long elapsed = now - nodStart;
+  const unsigned long total = LEG_MS * 2;
+  if (elapsed >= total) return false;
+
+  bool secondLeg = elapsed >= LEG_MS;
+  unsigned long legElapsed = secondLeg ? elapsed - LEG_MS : elapsed;
+  float eased = easeInOutCosine((float)legElapsed / LEG_MS);
+
+  float from = secondLeg ? NECK_MAX : nodFromAngle;
+  float to   = secondLeg ? nodFromAngle : NECK_MAX;
+  writeAngle(from + (to - from) * eased);
+  return true;
 }
 
 static void attachPan() {
   panServo.attach(PIN_NECK_PAN);
   attached = true;
-}
-static void detachPan() {
-  panServo.detach();
-  // Same floating-pin-noise fix as arms.cpp's detachAll() -- a floating
-  // signal wire picks up ambient/coupled noise an SG90 reads as real pulse
-  // commands, causing it to twitch with no command ever sent.
-  pinMode(PIN_NECK_PAN, OUTPUT);
-  digitalWrite(PIN_NECK_PAN, LOW);
-  attached = false;
 }
 
 void neckBegin() {
@@ -75,54 +88,53 @@ void neckBegin() {
   const unsigned long EASE_MS = 1000;
   unsigned long start = millis();
   unsigned long now;
-  const float from = 90.0f;  // SG90 power-on default center; only known reference at boot
+  const float from = 90.0f;   // SG90 power-on default center
   do {
     now = millis();
     float t = constrain((now - start) / (float)EASE_MS, 0.0f, 1.0f);
-    float eased = t < 0.5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2;
-    float angle = from + eased * ((float)CAL_NECK_PAN.base - from);
-    writeAngle(angle);
-    currentAngle = angle;
+    float eased = t < 0.5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2;   // boot ease only
+    writeAngle(from + eased * (IDLE_ANGLE - from));
     delay(15);
   } while (now - start < EASE_MS);
 
   currentState = NECK_IDLE;
-  lastMotionDemandMillis = now;
-  lastTickMillis = now;
 }
 
 void neckTick(unsigned long now) {
-  unsigned long tickDeltaMs = (lastTickMillis == 0 || now < lastTickMillis) ? 0 : now - lastTickMillis;
-  if (tickDeltaMs > 50) tickDeltaMs = 50;
-  float dt = tickDeltaMs / 1000.0f;
-  lastTickMillis = now;
-
-  bool haveRecentDemand = (now - lastMotionDemandMillis) < SERVO_DETACH_IDLE_MS;
-  if (!haveRecentDemand) {
-    if (attached) detachPan();
-    return;
-  }
+  // The reference file never detaches its servo -- attached once in
+  // setup(), held forever. Matching that: no idle-timeout detach here
+  // (listening sends no MQTT command at all, so detaching on command-
+  // silence would let the neck sag under gravity during any listening
+  // pause over 5s instead of holding its pose).
   if (!attached) attachPan();
 
-  // No per-state pose offset (same "all states sit flat at base" pattern
-  // arms.cpp uses) -- pan always settles to dead-center; only the sway on
-  // top differs by state.
-  currentAngle = approach(currentAngle, (float)CAL_NECK_PAN.base, dt);
-  writeAngle(currentAngle + swayAngle(now));
+  if (nodActive) {
+    if (!tickNod(now)) nodActive = false;
+    return;
+  }
+  tickPoseEase(now);
 }
 
 void neckOnCommand(const char* t, const char* v) {
-  lastMotionDemandMillis = millis();
-
   if (strcmp(t, "state") == 0) {
-    if      (strcmp(v, "idle") == 0)     currentState = NECK_IDLE;
-    else if (strcmp(v, "attend") == 0)   currentState = NECK_ATTEND;
-    else if (strcmp(v, "thinking") == 0) currentState = NECK_THINKING;
-    else if (strcmp(v, "speak") == 0)    currentState = NECK_SPEAK;
-    // unknown state value -> ignore silently
+    // Only idle and speak exist, per explicit request.
+    NeckState newState;
+    if      (strcmp(v, "speak") == 0) newState = NECK_SPEAK;
+    else if (strcmp(v, "idle") == 0)  newState = NECK_IDLE;
+    else return;
+
+    if (newState != currentState) {
+      nodActive = false;   // a real state change cancels an in-flight nod
+      currentState = newState;
+      startPoseEase(targetFor(newState), MOVE_MS);
+    }
+  } else if (strcmp(t, "gest") == 0) {
+    if (strcmp(v, "nod") == 0) {
+      nodActive = true;
+      nodStart = millis();
+      nodFromAngle = currentAngle;
+    }
+    // "tilt" is arms.cpp's now; anything else ignored.
   }
-  // t == "gest" with "nod"/"tilt" -- both are tilt-axis motions; no tilt
-  // servo exists on this board, so silently no-op (matches arms.cpp's
-  // "unrecognized gest -> ignore silently" pattern). t == "amp" or
-  // anything else: ignore too.
+  // t == "amp" or anything else: ignore too.
 }

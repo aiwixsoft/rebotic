@@ -273,6 +273,11 @@ CHUNK_MIN_CHARS = 12    # don't flush "Wow!" alone — merges into the next boun
 AMP_HZ = 40             # mouth-sync publish rate; faster floods MQTT, slower looks robotic
 AMP_SMOOTH = 0.3        # EMA factor — raw RMS makes the jaw chatter
 AMP_RMS_FULL_SCALE = 3000  # RMS value that maps to amp=255
+# _drain() publishes state:"idle" this far ahead of the trailing clause's
+# audio actually finishing (not after) — the body's own return-to-rest ease
+# takes a moment, so starting it slightly early lands it closer to "done"
+# right as the last word lands, instead of visibly lagging behind it.
+EARLY_IDLE_LEAD_MS = 200
 
 # ─── Language switch ─────────────────────────────────────────────────────────
 # "en" keeps the American persona above untouched. "ur" swaps every

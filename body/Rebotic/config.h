@@ -27,8 +27,14 @@
 #define MQTT_TOPIC_CMD   "rebotic/cmd"   // subscribe: laptop -> body
 
 // ─── Arm servo pins (spec 07) ───────────────────────────────────────────────
-// Left elbow repurposed as neck pan (PIN_NECK_PAN below). Shoulder-rotate
-// is hard-frozen in firmware pending an open jitter investigation (arms.cpp).
+// Left elbow repurposed as neck pan (PIN_NECK_PAN below).
+// R_SHOULDER_ROTATE (13) + R_SHOULDER_LIFT (32) are driven together as the
+// literal "servo1"/"servo2" shoulder pair from sholderNeck.ino (arms.cpp) --
+// strict port, per explicit request, of that file's pose/gesture behavior.
+// This un-freezes shoulder-rotate, previously hard-held pending an open
+// jitter investigation that was never confirmed fixed -- watch the physical
+// servo. L_SHOULDER_LIFT/L_SHOULDER_ROTATE/R_ELBOW aren't part of that
+// file's 3-servo model and just hold at rest, undriven.
 // GPIO 27 reserved for a possible future neck-tilt servo (spec 06; only
 // pan is actually built).
 #define PIN_L_SHOULDER_LIFT   26
@@ -53,18 +59,23 @@ struct ServoCal {
   bool    mirror;   // true: angle is mapped as (180 - angle) before writing
 };
 
-// Right arm mirrors the left; flip `mirror` here, not by rewiring, if a
-// joint moves the wrong way. Lift base is 12 (not 0) to stay off the
-// mechanical floor -- sitting a loaded joint right at a hard stop buzzes.
+// L_SHOULDER_LIFT/L_SHOULDER_ROTATE/R_ELBOW: held at rest, undriven (see
+// above) -- calibration kept for reference/future use.
 static const ServoCal CAL_L_SHOULDER_LIFT   = {12, 0, 150, false};
 static const ServoCal CAL_L_SHOULDER_ROTATE = {90, 30, 150, false};
-static const ServoCal CAL_R_SHOULDER_LIFT   = {12, 0, 150, false};
-static const ServoCal CAL_R_SHOULDER_ROTATE = {90, 30, 150, true};
 static const ServoCal CAL_R_ELBOW           = {100, 90, 150, true};
 
-// Neck pan -- placeholder like the others above, calibrate during bring-up.
-// base=90 is dead-center/looking-forward; +-60deg of travel each side.
-static const ServoCal CAL_NECK_PAN          = {90, 30, 150, false};
+// R_SHOULDER_ROTATE + R_SHOULDER_LIFT: literal sholderNeck.ino values --
+// both constrained to 90-180, no mirror transform (that file applies none).
+// arms.cpp uses these two directly (SERVO12_MIN/MAX), not through the
+// generic ServoCal/writeJoint path the other joints use.
+static const ServoCal CAL_R_SHOULDER_ROTATE = {90, 90, 180, false};
+static const ServoCal CAL_R_SHOULDER_LIFT   = {180, 90, 180, false};
+
+// Neck pan -- literal sholderNeck.ino values (0-20, not this board's
+// original 30-150 spec-06 range). neck.cpp now holds discrete per-state
+// positions (0/15/5/10) instead of a continuous centered sway.
+static const ServoCal CAL_NECK_PAN          = {0, 0, 20, false};
 
 // ─── Timing / fail-safe (spec 02) ──────────────────────────────────────────
 #define NO_CMD_TIMEOUT_MS    10000  // no cmd this long -> force state=idle

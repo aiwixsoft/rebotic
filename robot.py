@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
     robot = Robot()
     time.sleep(0.5)  # let the async connect land
-    robot.state("attend")
+    robot.state("speak")   # only idle/speak exist now
     robot.gest("nod")
     for v in (0, 80, 200, 120, 0):
         robot.amp(v)

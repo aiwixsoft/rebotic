@@ -98,8 +98,7 @@ class Rebotic:
         while True:
             ev = await self.bus.get()
             if ev.type == "speech_start":
-                # DETECT — head turns before any transcript exists
-                self.robot.state("attend")
+                pass   # only idle/speak exist now -- nothing to publish here
             elif ev.type == "partial":
                 log.debug("partial: %s", ev.data["text"])
             elif ev.type == "barge_in":
@@ -180,18 +179,18 @@ class Rebotic:
             await self._turn(text)
 
     async def _speak(self, tokens: AsyncIterator[str]) -> None:
-        """THINK → SPEAK → RESET, shared by _turn/_say_line/guest welcome —
-        same state/interrupt handling regardless of where the token stream
-        (LLM-generated or a fixed line) comes from."""
+        """SPEAK → RESET, shared by _turn/_say_line/guest welcome -- same
+        state/interrupt handling regardless of where the token stream
+        (LLM-generated or a fixed line) comes from. Only idle/speak exist
+        now -- voice.speak_stream() publishes "speak" itself, immediately."""
         self._interrupted = False
-        self.robot.state("thinking")
         try:
             self.hearing.robot_speaking = True  # duck VAD, arm barge-in
             await self.voice.speak_stream(tokens)
         finally:
             self.hearing.robot_speaking = False
         if not self._interrupted:
-            self.robot.state("idle")  # RESET — barge-in already set attend instead
+            self.robot.state("idle")  # RESET — barge-in already set idle instead
 
     async def _say_line(self, text: str) -> None:
         """A fixed, non-LLM-generated line (session prompts)."""

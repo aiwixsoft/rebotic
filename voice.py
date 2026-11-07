@@ -240,16 +240,26 @@ class Voice:
             self._pcm.clear()  # without this, killed audio resumes a beat later
         self._prev_amp = 0
         self.mqtt.amp(0)
-        self.mqtt.state("attend")
+        self.mqtt.state("idle")   # only idle/speak exist now
 
     def close(self) -> None:
         self._stream.stop()
         self._stream.close()
 
     async def _drain(self) -> None:
+        # Only ever called once, after the whole stream's final clause —
+        # never between clauses — so firing state:"idle" a little before
+        # the buffer actually empties doesn't risk cutting off mid-reply,
+        # it just gives the body's return-to-rest ease a head start on the
+        # last fraction-of-a-second tail.
+        early_lead_bytes = int(self.cfg.TTS_RATE * self.cfg.EARLY_IDLE_LEAD_MS / 1000) * 2
+        idle_sent_early = False
         while not self._abort.is_set():
             with self._lock:
                 pending = len(self._pcm)
+            if not idle_sent_early and pending <= early_lead_bytes:
+                self.mqtt.state("idle")
+                idle_sent_early = True
             if not pending:
                 break
             await asyncio.sleep(0.02)
